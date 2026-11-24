@@ -1,42 +1,71 @@
 name: Build APK
+
 on:
   push:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Unzip project
+      # Works both ways: project files uploaded directly, OR a .zip uploaded to the repo root
+      # (any zip name, spaces allowed, newest zip is used, extra top-level folder is fine)
+      - name: Find project (unzip if needed)
         run: |
-          ZIP=$(ls -t IOSConnectCluster*.zip 2>/dev/null | head -1)
-          if [ -z "$ZIP" ]; then echo "IOSConnectCluster*.zip repo me nahi mila"; ls -la; exit 1; fi
-          echo "Using $ZIP"
-          mkdir -p _src
-          unzip -q -o "$ZIP" -d _src
-          SETTINGS=$(find _src -maxdepth 3 -name settings.gradle | head -1)
-          if [ -z "$SETTINGS" ]; then echo "settings.gradle zip me nahi mila"; find _src | head -50; exit 1; fi
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+          if [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            echo "Project files found in repo root"
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ZIP="$(ls -t ./*.zip 2>/dev/null | head -n 1 || true)"
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: no settings.gradle and no .zip in repo root. Files:"
+            ls -la
+            exit 1
+          fi
+          echo "Using zip: $ZIP"
+          mkdir -p _proj
+          unzip -q -o "$ZIP" -d _proj
+          SETTINGS="$(find _proj \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/__MACOSX/*' | head -n 1)"
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: zip has no settings.gradle. Contents:"
+            find _proj -maxdepth 3 | head -50
+            exit 1
+          fi
+          DIR="$(dirname "$SETTINGS")"
+          echo "Project dir: $DIR"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
       - name: Accept Android SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
 
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
 
+      # api.xposed.info is sometimes down, so retry up to 3 times
       - name: Build debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle assembleDebug --no-daemon --stacktrace
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: IOSConnectCluster-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
-          
+        run: |
+          cd "$PROJECT_DIR"
+          for i in 1 2 3; do
+            echo "=== Build attempt $i ==="
+            if gradle assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"; then
+              if ls app/build/outputs/apk/debug/*.apk >/dev/null 2>&1; then
